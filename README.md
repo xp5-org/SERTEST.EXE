@@ -4,5 +4,5 @@ checks for rx/tx latency at all baud rates & line/status error latency
 
 also a virtual uart kernel module used with kvm testing, to load a virtual serial device & attach a python listener 
   
-<img width="640" height="480" alt="screenshot-box86_1-28-28" src="https://github.com/user-attachments/assets/504bfb8a-8d4c-4d9f-bbb8-195985c8d83b" />
 
+<img alt="output" src="https://github.com/user-attachments/assets/7ca28eb6-e31f-4ccf-b3ee-3b2c28fd975e" />
