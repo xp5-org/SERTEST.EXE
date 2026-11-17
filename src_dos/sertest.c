@@ -76,302 +76,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <conio.h>
-#include <dos.h>
-#include <i86.h>
 #include <stdarg.h>
+#include "sertest_hw.h"
 
-#define REG_DATA  0
-#define REG_IER   1
-#define REG_DLL   0
-#define REG_DLH   1
-#define REG_IIR   2
-#define REG_FCR   2
-#define REG_LCR   3
-#define REG_MCR   4
-#define REG_LSR   5
-#define REG_MSR   6
-#define REG_SCR   7
-
-#define LSR_DR    0x01
-#define LSR_OE    0x02
-#define LSR_BI    0x10
-#define LSR_THRE  0x20
-#define LSR_TEMT  0x40
-
-#define MCR_DTR   0x01
-#define MCR_RTS   0x02
-#define MCR_OUT1  0x04
-#define MCR_OUT2  0x08
-#define MCR_LOOP  0x10
-
-#define MSR_DCTS  0x01
-#define MSR_DDSR  0x02
-#define MSR_TERI  0x04
-#define MSR_DDCD  0x08
-#define MSR_CTS   0x10
-#define MSR_DSR   0x20
-#define MSR_RI    0x40
-#define MSR_DCD   0x80
-
-#define PIC1_CMD  0x20
-#define PIC1_DATA 0x21
-
-#define PIT_CH0   0x40
-#define PIT_CMD   0x43
-#define PIT_HZ    1193182UL
-
-#define TICKS_1MS    1193UL
-#define TICKS_10MS   11932UL
-#define TICKS_100MS  119318UL
-#define TICKS_1S     1193182UL
-#define TMO_TICKS    TICKS_1S   /* per-sample timeout */
-
-
-#define NCHK      22        /* page 1 checks: column 1 holds 11, column 2 the rest */
-#define NCOL1     11
-#define NBAUD     12
-#define BI_2400   5         /* baud_tab index of 2400 */
-#define NPAGE     6
-
-#define P1_FIRST  3         /* page 1: first check row */
-#define NOTE_TOP  14        /* page 1 failure-notes box */
-#define NOTE_ROWS 6
-#define LEG_ROW   22        /* one-line legend under a page's box */
-#define STAGE_ROW 23        /* stage / progress line, run counts when done */
-#define FOOT_ROW  24        /* keys and SERTEST RESULT: */
-
-#define A_NORM    0x07
-#define A_BRIGHT  0x0F
-
-/* Row states */
-#define ST_PEND   0
-#define ST_RUN    1
-#define ST_PASS   2
-#define ST_FAIL   3
-#define ST_SKIP   4         /* panel not run */
-#define ST_NC     5         /* not wired on this plug */
-#define ST_NA     6         /* check doesn't apply to this panel or UART */
-
-static const unsigned long baud_tab[NBAUD] = {
-    110, 150, 300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200UL
-};
-static const unsigned int div_tab[NBAUD] = {
-    1047, 768, 384, 192, 96, 48, 24, 12, 6, 3, 2, 1
-};
-/* Rate labels for page 2's RATE column: 5 chars max. */
-static const char *rate_lbl[NBAUD] = {
-    "110", "150", "300", "600", "1200", "2400", "4800", "9600", "19.2k", "38.4k", "57.6k", "115k"
-};
-static int nbaud = NBAUD, baud0 = 0;   /* active slice of baud_tab */
-static int cur_bi = NBAUD - 1;
-static unsigned char cur_lcr = 0x03;
-
-/* Bit patterns every sweep sends, masked to the word length in use. */
-static const unsigned char pat_tab[8] = { 0x00, 0xFF, 0x55, 0xAA, 0x0F, 0xF0, 0x01, 0x80 };
-
-
-/* Page 1 checks. Column 1 is the data path, column 2 the modem
- * lines and interrupts. panels: 1 INT, 2 EXT, 3 both. */
-enum {
-    C_SCRATCH, C_PLUG, C_DATA, C_FMT, C_FMT2400, C_BURST, C_OVERRUN, C_BRKPOLL, C_BRKLATE, C_THRE, C_FCRSW,
-    C_RTS, C_DTR, C_DCD, C_RI, C_DELTA, C_IRQRX, C_IRQTHRE, C_IRQLSR, C_IRQMSR, C_IRQTMO,
-    C_TYPESW
-};
-
-struct chk_def {
-    const char   *name;         /* page 1 row, 24 chars at most */
-    const char   *stage;        /* stage line and SERLOG tag */
-    unsigned char panels;
-};
-
-static char fmt_top_name[24] = "Formats x40 @115200";
-
-static const struct chk_def chk[NCHK] = {
-    { "Scratch register R/W",   "SCRATCH",  1 },
-    { "Plug detect",            "PLUG",     2 },
-    { "Data 00-FF  TX->RX",     "DATA",     3 },
-    { fmt_top_name,             "FORMAT",   3 },
-    { "Formats x40 @2400",      "FMT2400",  3 },
-    { "FIFO burst, 4 formats",  "FIFO",     3 },
-    { "Overrun -> OE",          "OVERRUN",  3 },
-    { "Break -> BI, polled",    "BRK-POLL", 3 },
-    { "Break -> BI, late read", "BRK-LATE", 3 },
-    { "THRE/TEMT",              "THRE",     3 },
-    { "FCR mode switch",        "FCRSW",    3 },
-    { "RTS -> CTS",             "RTS-CTS",  3 },
-    { "DTR -> DSR",             "DTR-DSR",  3 },
-    { "OUT2|DTR -> DCD",        "DCD",      3 },
-    { "OUT1|DTR -> RI",         "RI",       3 },
-    { "MSR deltas + TERI",      "DELTA",    3 },
-    { "IRQ RX data",            "IRQ-RX",   3 },
-    { "IRQ THR empty",          "IRQ-THRE", 3 },
-    { "IRQ line status (OE)",   "IRQ-LSR",  3 },
-    { "IRQ modem status",       "IRQ-MSR",  3 },
-    { "IRQ RX FIFO timeout",    "IRQ-TMO",  3 },
-    { "16550->16450 type sw",   "TYPESW",   1 }
-};
-
-/* Failure details for SERLOG.TXT and page 1's notes box. Capped so one
- * broken rate cannot flood the log. */
-#define NOTE_MAX 48
-#define NOTE_LEN 96                     /* the log line; the screen shows 80 */
-static char notes[NOTE_MAX][NOTE_LEN];
-static unsigned char note_pg[NOTE_MAX]; /* page that wrote each note */
-static int  nnotes, notes_dropped;
-static const char *note_panel = "";
-static int  cur_run_pg;                 /* page now running, tags new notes */
-
-static void note(const char *fmt, ...)
-{
-    static char buf[256];
-    va_list ap;
-    int n;
-    if (nnotes == NOTE_MAX) {
-        notes_dropped++;
-        return;
-    }
-    note_pg[nnotes] = (unsigned char) cur_run_pg;
-    n = sprintf(buf, "%s ", note_panel);
-    va_start(ap, fmt);
-    vsprintf(buf + n, fmt, ap);         /* callers keep it under 250 */
-    va_end(ap);
-    /* keep a long note out of the next slot */
-    strncpy(notes[nnotes], buf, NOTE_LEN - 1);
-    notes[nnotes][NOTE_LEN - 1] = '\0';
-    nnotes++;
-}
-
-/* A page rerun starts with none of that page's old notes. */
-static void notes_drop_pg(int pg)
-{
-    int i, j = 0;
-    for (i = 0; i < nnotes; i++)
-        if (note_pg[i] != pg) {
-            if (j != i) {
-                strcpy(notes[j], notes[i]);
-                note_pg[j] = note_pg[i];
-            }
-            j++;
-        }
-    nnotes = j;
-    notes_dropped = 0;
-}
-
-static const char *prog_path = "";
-static int chk_st[2][NCHK];             /* [0 INT, 1 EXT][check] */
-
-static unsigned int  port;
-static int           com_n = 1;
-static int           irq;
-static int           do_int = 1, do_ext = 1, no_ri = 0, no_brk = 0;
-static int           lat_mode = 0;          /* /LAT: live latency-only screen */
-static int           step_mode = 0;         /* /STEP: each stage waits for G */
-static int           dual_mode = 0;         /* /DUAL: COM1 + COM2 at once */
-static char          lat_arg[40] = "ALL";
-static int           lat_secs = 2;          /* /T: pass length */
-static int           ext_noplug;
-static const char   *uart_name = "?";
-static int           has_fifo;              /* 16550A: working FIFOs */
-static int           has_scr;               /* 16450 and up: scratch register */
-static unsigned int  wd_lpt;                /* LPT1 base if the type switch answered */
-static unsigned char wd_sel, wd_r5;         /* WD76C30 index and register 5 as found */
-static const char   *cpu_name = "?";
-static unsigned long poll16;                /* one idle poll-loop pass, 1/16 PIT ticks */
-static int           cpu_top = 11;          /* fastest rate the CPU can poll */
-static unsigned char far *vram;
-
-static volatile unsigned int  isr_hits;
-static volatile int           isr_data;
-static volatile unsigned char isr_iir;
-static volatile unsigned char isr_lsr;
-static void (__interrupt __far *old_isr)(void);
-
-/* ------------------------------------------------------------------ PIT */
-
-static unsigned int  t_last;
-static unsigned long t_acc;
-
-static unsigned int pit_read(void)
-{
-    unsigned char lo, hi;
-    _disable();
-    outp(PIT_CMD, 0x00);            /* latch channel 0 */
-    lo = (unsigned char) inp(PIT_CH0);
-    hi = (unsigned char) inp(PIT_CH0);
-    _enable();
-    return ((unsigned int) hi << 8) | lo;
-}
-
-static void pit_mode(unsigned char mode_cmd)
-{
-    _disable();
-    outp(PIT_CMD, mode_cmd);        /* ch0, lobyte/hibyte, mode 2 0x34 or 3 0x36 */
-    outp(PIT_CH0, 0);
-    outp(PIT_CH0, 0);               /* reload 0 == 65536, the BIOS's own 18.2Hz */
-    _enable();
-}
-
-/* Every PIT read also advances the latency pass clock p_acc. */
-static unsigned long p_acc;
-
-static unsigned int pit_step(void)
-{
-    unsigned int c = pit_read(), d = (unsigned int) (t_last - c);
-    t_last = c;
-    p_acc += d;
-    return d;
-}
-
-static void clk_init(void)
-{
-    t_last = pit_read();
-    t_acc = p_acc = 0;
-}
-
-static void t_start(void)
-{
-    (void) pit_step();
-    t_acc = 0;
-}
-
-/* Elapsed ticks since t_start. The counter counts down and wraps every
- * 65536 ticks, so poll more often than that. */
-static unsigned long t_now(void)
-{
-    t_acc += pit_step();
-    return t_acc;
-}
-
-/* Run clock for latency mode: BIOS tick count at 0040:006C. The PIT
- * clocks would lose wraps during floppy log writes. */
-static unsigned long run_t0;
-
-static unsigned long bios_ticks(void)
-{
-    unsigned long far *t = (unsigned long far *) MK_FP(0x0040, 0x006C);
-    unsigned long v;
-    _disable();
-    v = *t;
-    _enable();
-    return v;
-}
-
-static unsigned long run_secs(void)
-{
-    return (bios_ticks() - run_t0) * 100UL / 1821UL;
-}
-
-static void t_sleep(unsigned long ticks)
-{
-    t_start();
-    while (t_now() < ticks)
-        ;
-}
-
-/* Wait after a rate change before timing. An emulator catches up after
- * the host port reconfig and a guest wait in that window reads long. */
-#define RATE_SETTLE (150UL * TICKS_1MS)
+#include "sertest_defs.h"
 
 /* Keys during a run. Sub-tests poll between items and stop the page at
  * the next boundary. Esc leaves the program, R reruns the page. */
@@ -718,997 +426,7 @@ static void draw_page1(int fresh)
         draw_notes();
 }
 
-/* ----------------------------------------------------------------- UART */
-
-static void uart_init(unsigned char mcr)
-{
-    unsigned int div = div_tab[cur_bi];
-    outp(port + REG_IER, 0x00);
-    outp(port + REG_LCR, 0x80);
-    outp(port + REG_DLL, div & 0xFF);
-    outp(port + REG_DLH, div >> 8);
-    outp(port + REG_LCR, cur_lcr);
-    outp(port + REG_FCR, 0x00);     /* FIFO off: strict per-byte behavior */
-    outp(port + REG_MCR, mcr);
-    (void) inp(port + REG_LSR);
-    (void) inp(port + REG_MSR);
-    (void) inp(port + REG_IIR);
-}
-
-static void drain_rx(void)
-{
-    int n = 0;
-    while ((inp(port + REG_LSR) & LSR_DR) && n++ < 64)
-        (void) inp(port + REG_DATA);
-}
-
-static void detect_uart(void)
-{
-    unsigned char iir;
-    outp(port + REG_FCR, 0xC7);
-    iir = (unsigned char) (inp(port + REG_IIR) & 0xC0);
-    outp(port + REG_FCR, 0x00);
-    has_fifo = (iir == 0xC0);
-    has_scr = 1;
-    if (iir == 0xC0)
-        uart_name = "16550A";
-    else if (iir == 0x80)
-        uart_name = "16550";
-    else {
-        outp(port + REG_SCR, 0x5A);
-        has_scr = (inp(port + REG_SCR) == 0x5A);
-        uart_name = has_scr ? "16450" : "8250";
-    }
-}
-
-/* ---- CPU class from the FLAGS bits each generation lets software change.
- * An 8086 reads FLAGS 12-15 as 1, a 286 as 0, a 386 cannot set EFLAGS.AC,
- * a 486 cannot set ID, otherwise CPUID gives the family. The 32-bit parts
- * are hand-assembled bytes since the build is wcl -0. */
-extern unsigned int flags_get(void);
-#pragma aux flags_get = "pushf" "pop ax" value [ax] modify exact [ax];
-
-/* FLAGS = f, read it back, restore the old FLAGS. */
-extern unsigned int flags_try(unsigned int f);
-#pragma aux flags_try = "pushf" "push ax" "popf" "pushf" "pop ax" "popf" \
-    parm [ax] value [ax] modify exact [ax];
-
-/* EFLAGS AC and ID toggled, read back, restored. Returns the high word
- * of the changed bits. */
-extern unsigned int eflags_flip(void);
-#pragma aux eflags_flip = \
-    0x66 0x9C                       /* pushfd */ \
-    0x66 0x58                       /* pop eax */ \
-    0x66 0x8B 0xC8                  /* mov ecx, eax */ \
-    0x66 0x35 0x00 0x00 0x24 0x00   /* xor eax, 240000h */ \
-    0x66 0x50                       /* push eax */ \
-    0x66 0x9D                       /* popfd */ \
-    0x66 0x9C                       /* pushfd */ \
-    0x66 0x58                       /* pop eax */ \
-    0x66 0x51                       /* push ecx */ \
-    0x66 0x9D                       /* popfd */ \
-    0x66 0x33 0xC1                  /* xor eax, ecx */ \
-    0x66 0xC1 0xE8 0x10             /* shr eax, 16 */ \
-    value [ax] modify exact [ax cx];
-
-/* CPUID leaf 1: the family field. */
-extern unsigned int cpuid_family(void);
-#pragma aux cpuid_family = \
-    0x66 0xB8 0x01 0x00 0x00 0x00   /* mov eax, 1 */ \
-    0x0F 0xA2                       /* cpuid */ \
-    0x66 0xC1 0xE8 0x08             /* shr eax, 8 */ \
-    0x25 0x0F 0x00                  /* and ax, 0Fh */ \
-    value [ax] modify exact [ax bx cx dx];
-
-static void detect_cpu(void)
-{
-    unsigned int f = flags_get(), hi;
-
-    if ((flags_try(f & 0x0FFF) & 0xF000) == 0xF000)
-        cpu_name = "8086/88";
-    else if ((flags_try(f | 0xF000) & 0xF000) == 0)
-        cpu_name = "286";
-    else {
-        hi = eflags_flip();
-        if (!(hi & 0x0004))
-            cpu_name = "386";
-        else if (!(hi & 0x0020))
-            cpu_name = "486";
-        else {
-            f = cpuid_family();
-            cpu_name = f == 4 ? "486" : f == 5 ? "P5" : "P6+";
-        }
-    }
-}
-
-/* ---- Poll speed. Back-to-back checks poll each byte and must go round
- * faster than the line delivers characters. Time the loop idle and call a
- * rate pollable when one 8N1 character lasts 3 idle passes. */
-static unsigned long bit64(int i);
-
-static void cal_poll(void)
-{
-    unsigned long t, n = 0;
-    unsigned char l;
-    int i;
-
-    t_start();
-    do {
-        l = (unsigned char) inp(port + REG_LSR);
-        t = t_now();
-        if (l & LSR_DR)
-            (void) inp(port + REG_DATA);
-        n++;
-    } while (t < 5UL * TICKS_10MS);
-    poll16 = t * 16UL / n;
-    for (i = NBAUD - 1; i > 0; i--)
-        if (10UL * 16UL * bit64(i) / 64UL >= 3UL * poll16)
-            break;
-    cpu_top = i;
-}
-
-static unsigned char last_lsr;
-
-static int top_bi(void) { return baud0 + nbaud - 1; }
-
-static unsigned long bit64(int i);
-static int wait_idle(void);
-
-/* One character time at rate i and LCR lcr in PIT ticks, counted in
- * half bits. */
-static unsigned long frame_ticks(int i, unsigned char lcr)
-{
-    unsigned long half = 2 + 2 * (5 + (lcr & 3)) + ((lcr & 0x08) ? 2 : 0)
-                         + ((lcr & 0x04) ? ((lcr & 3) == 0 ? 3 : 4) : 2);
-    return half * bit64(i) / 128;
-}
-
-/* One byte out, time until LSR.DR, returns what came back. last_lsr keeps
- * the LSR that reported DR. */
-static int xfer_byte(unsigned char b, unsigned long *ticks, unsigned char *got)
-{
-    unsigned char l;
-    t_start();
-    while (!(inp(port + REG_LSR) & LSR_THRE))
-        if (t_now() >= TMO_TICKS)
-            return 0;
-    drain_rx();
-    t_start();
-    outp(port + REG_DATA, b);
-    while (!((l = (unsigned char) inp(port + REG_LSR)) & LSR_DR))
-        if (t_now() >= TMO_TICKS)
-            return 0;
-    *ticks = t_now();
-    last_lsr = l;
-    *got = (unsigned char) inp(port + REG_DATA);
-    return 1;
-}
-
-/* Full 00-FF at the top active rate, 8N1. */
-static int data_test(unsigned char mcr)
-{
-    unsigned long t;
-    unsigned char got;
-    int b, ok = 1, tmo = 0;
-
-    cur_bi = top_bi();
-    cur_lcr = 0x03;
-    uart_init(mcr);
-    for (b = 0; b < 256 && tmo < 3; b++) {
-        progress(b, 256);
-        if (!xfer_byte((unsigned char) b, &t, &got)) {
-            ok = 0;
-            tmo++;
-        } else if (got != (unsigned char) b)
-            ok = 0;
-    }
-    progress(256, 256);
-    return ok;
-}
-
-/* LCR as text: 8N1, 7E2, 5N1.5. */
-static void fmt_name(char *buf, unsigned char lcr)
-{
-    static const char par[8] = { 'N', 'O', 'N', 'E', 'N', 'M', 'N', 'S' };
-    int bits = 5 + (lcr & 3);
-    sprintf(buf, "%d%c%s", bits, par[(lcr >> 3) & 7],
-            (lcr & 0x04) ? (bits == 5 ? "1.5" : "2") : "1");
-}
-
-/* 5-8 data bits x N/O/E/M/S parity x 1/2 stop bits, 40 LCR values, at
- * rate bi. Each pattern must come back masked to the word length with no
- * error bits. Below 1200 baud the patterns drop to 00 FF 55 AA. */
-static int format_test(unsigned char mcr, int bi)
-{
-    static const unsigned char par[5] = { 0x00, 0x08, 0x18, 0x28, 0x38 };
-    unsigned long t;
-    unsigned char got, mask;
-    char fn[8];
-    int wl, pi, sb, p, np, ok = 1, tmo = 0;
-
-    cur_bi = bi;
-    np = baud_tab[cur_bi] >= 1200 ? 8 : 4;
-    for (wl = 0; wl < 4 && tmo < 3; wl++) {
-        mask = (unsigned char) ((1 << (5 + wl)) - 1);
-        for (pi = 0; pi < 5 && tmo < 3; pi++)
-            for (sb = 0; sb < 2 && tmo < 3; sb++) {
-                progress(wl * 10 + pi * 2 + sb, 40);
-                cur_lcr = (unsigned char) (wl | par[pi] | (sb << 2));
-                fmt_name(fn, cur_lcr);
-                uart_init(mcr);
-                for (p = 0; p < np; p++) {
-                    if (!xfer_byte(pat_tab[p], &t, &got)) {
-                        ok = 0;
-                        tmo++;
-                        note("fmt %lu %s: %02X timed out", baud_tab[bi], fn, pat_tab[p]);
-                        break;
-                    }
-                    if ((got & mask) != (pat_tab[p] & mask) || (last_lsr & 0x0E)) {
-                        ok = 0;
-                        note("fmt %lu %s: sent %02X got %02X lsr %02X", baud_tab[bi], fn, pat_tab[p] & mask, got, last_lsr);
-                    }
-                }
-            }
-    }
-    if (tmo >= 3)
-        note("fmt %lu: 3 timeouts, rest skipped", baud_tab[bi]);
-    progress(40, 40);
-    cur_bi = top_bi();
-    cur_lcr = 0x03;
-    uart_init(mcr);
-    return ok;
-}
-
-/* ---- FIFO burst: pseudo-random bytes back to back with 16550 FIFOs on.
- * Makes 86Box keep up at line rate. A unique sequence shows a dropped,
- * doubled or reordered byte. Seeded per rate, format and panel. */
-
-#define BURST_MAX 256
-static unsigned char burst_buf[BURST_MAX];
-static unsigned int  rnd_state;
-static int burst_done, burst_total;     /* bytes back so far / expected, this rate */
-
-static unsigned char rnd8(void)
-{
-    rnd_state = rnd_state * 25173u + 13849u;
-    return (unsigned char) (rnd_state >> 8);
-}
-
-static int burst_len(unsigned long b)
-{
-    return b >= 9600 ? 256 : (b >= 1200 ? 128 : 32);
-}
-
-static int burst_one(unsigned char mcr, unsigned char lcr, int n, unsigned int seed)
-{
-    unsigned char mask = (unsigned char) ((1 << (5 + (lcr & 3))) - 1), lsr, c, err = 0, badc = 0;
-    unsigned long last = 0, char_ticks = 12UL * PIT_HZ / baud_tab[cur_bi];
-    int i, k, sent = 0, recv = 0, extra = 0, bad = -1;
-    char fn[8];
-
-    cur_lcr = lcr;
-    uart_init(mcr);
-    outp(port + REG_FCR, 0x07);         /* FIFOs on, both cleared, RX trigger 1 */
-    drain_rx();
-    rnd_state = seed;
-    for (i = 0; i < n; i++)
-        burst_buf[i] = (unsigned char) (rnd8() & mask);
-
-    t_start();
-    while (recv < n) {
-        lsr = (unsigned char) inp(port + REG_LSR);
-        err |= (unsigned char) (lsr & 0x8E);   /* OE PE FE, RX FIFO error */
-        if (lsr & LSR_DR) {
-            c = (unsigned char) inp(port + REG_DATA);
-            if (bad < 0 && c != burst_buf[recv]) {
-                bad = recv;
-                badc = c;
-            }
-            recv++;
-            progress(burst_done + recv, burst_total);
-            last = t_now();
-            continue;
-        }
-        if ((lsr & LSR_THRE) && sent < n)       /* TX FIFO empty: refill 16 */
-            for (k = 0; k < 16 && sent < n; k++)
-                outp(port + REG_DATA, burst_buf[sent++]);
-        if (t_now() - last > TMO_TICKS)          /* 1s with no byte back */
-            break;
-    }
-    /* anything still arriving after the burst is a duplicate */
-    t_sleep(4 * char_ticks);
-    while ((inp(port + REG_LSR) & LSR_DR) && extra < 64) {
-        (void) inp(port + REG_DATA);
-        extra++;
-    }
-    outp(port + REG_FCR, 0x00);
-
-    if (recv == n && bad < 0 && !err && !extra)
-        return 1;
-    fmt_name(fn, lcr);
-    if (recv < n)
-        note("burst %lu %s: %d/%d back", baud_tab[cur_bi], fn, recv, n);
-    if (bad >= 0)
-        note("burst %lu %s: #%d sent %02X got %02X", baud_tab[cur_bi], fn, bad, burst_buf[bad], badc);
-    if (err)
-        note("burst %lu %s: lsr errors %02X", baud_tab[cur_bi], fn, err);
-    if (extra)
-        note("burst %lu %s: %d extra bytes", baud_tab[cur_bi], fn, extra);
-    return 0;
-}
-
-/* The burst rate: the top active rate, or the fastest the CPU can poll if
- * lower. -1 when that is below the active slice. */
-static int burst_bi(void)
-{
-    if (top_bi() <= cpu_top)
-        return top_bi();
-    return cpu_top >= baud0 ? cpu_top : -1;
-}
-
-/* 8N1, 7E1, 6O2, 5N1.5 at burst_bi. Needs a 16550A since the TX refill
- * writes 16 bytes at once. */
-static int burst_test(unsigned char mcr, unsigned int panel_seed)
-{
-    static const unsigned char lcrs[4] = { 0x03, 0x1A, 0x0D, 0x04 };
-    int f, ok = 1, n;
-
-    cur_bi = burst_bi();
-    n = burst_len(baud_tab[cur_bi]);
-    burst_done = 0;
-    burst_total = 4 * n;
-    progress(0, burst_total);
-    for (f = 0; f < 4; f++) {
-        if (!burst_one(mcr, lcrs[f], n, (unsigned int) ((cur_bi << 8) ^ (f * 97) ^ panel_seed)))
-            ok = 0;
-        burst_done += n;
-    }
-    progress(burst_total, burst_total);
-    cur_bi = top_bi();
-    cur_lcr = 0x03;
-    uart_init(mcr);
-    return ok;
-}
-
-static int wait_msr(unsigned char mask, unsigned char want, unsigned long *ticks)
-{
-    unsigned long t;
-    for (;;) {
-        t = t_now();
-        if ((inp(port + REG_MSR) & mask) == want) {
-            *ticks = t;
-            return 1;
-        }
-        if (t >= TMO_TICKS)
-            return 0;
-    }
-}
-
-/* Toggle one MCR output nsamp times and time the MSR input following it.
- * base holds the other MCR bits. *worst, if not NULL, is raised to the
- * slowest edge. */
-static int line_test(unsigned char base, unsigned char obit, unsigned char ibit,
-                     int nsamp, unsigned long *worst)
-{
-    unsigned long t;
-    int i, rising, ok = 1;
-
-    for (i = 0; i < nsamp; i++) {
-        rising = !(i & 1);
-        outp(port + REG_MCR, rising ? base : (base | obit));
-        t_start();
-        if (!wait_msr(ibit, rising ? 0 : ibit, &t)) {
-            ok = 0;                          /* never settled to the start state */
-            t = TMO_TICKS;
-        } else {
-            t_start();
-            outp(port + REG_MCR, rising ? (base | obit) : base);
-            if (!wait_msr(ibit, rising ? ibit : 0, &t)) {
-                ok = 0;
-                t = TMO_TICKS;
-            }
-        }
-        if (worst && t > *worst)
-            *worst = t;
-    }
-    outp(port + REG_MCR, base);
-    return ok;
-}
-
-/* One interrupt per check. The first records IIR and sets IER to 0, then
- * each handler clears what it raised. */
-static void __interrupt __far com_isr(void)
-{
-    unsigned char iir = (unsigned char) inp(port + REG_IIR);
-    if (isr_hits++ == 0) {
-        isr_iir = iir;
-        outp(port + REG_IER, 0x00);
-    }
-    isr_lsr |= (unsigned char) inp(port + REG_LSR);
-    while (inp(port + REG_LSR) & LSR_DR)
-        isr_data = inp(port + REG_DATA);
-    (void) inp(port + REG_MSR);
-    outp(PIC1_CMD, 0x20);
-}
-
-static int wait_thre(void)
-{
-    t_start();
-    while (!(inp(port + REG_LSR) & LSR_THRE))
-        if (t_now() >= TMO_TICKS)
-            return 0;
-    return 1;
-}
-
-/* Overrun, FIFO off: three bytes back to back, none read. A real 8250
- * keeps the newest in RBR and sets OE. Only THRE is polled, and only before
- * the last byte, so OE survives to the final read. */
-static int overrun_test(unsigned char mcr)
-{
-    unsigned long ch;
-    unsigned char l, d, l2;
-    int ok;
-
-    cur_bi = top_bi();
-    cur_lcr = 0x03;
-    uart_init(mcr);
-    ch = frame_ticks(cur_bi, cur_lcr);
-    if (!wait_idle())
-        return 0;
-    (void) inp(port + REG_LSR);
-    outp(port + REG_DATA, 0x11);
-    if (!wait_thre())
-        return 0;
-    outp(port + REG_DATA, 0x22);
-    if (!wait_thre())
-        return 0;
-    outp(port + REG_DATA, 0x33);
-    t_sleep(20 * ch + TICKS_100MS / 2);
-    l = (unsigned char) inp(port + REG_LSR);
-    d = (unsigned char) inp(port + REG_DATA);
-    l2 = (unsigned char) inp(port + REG_LSR);
-    ok = (l & (LSR_DR | LSR_OE)) == (LSR_DR | LSR_OE) && d == 0x33 && !(l2 & (LSR_DR | LSR_OE));
-    if (!ok)
-        note("overrun %lu: LSR %02X RBR %02X, then LSR %02X (want 03 33, then neither)",
-             baud_tab[cur_bi], l, d, l2);
-    drain_rx();
-    return ok;
-}
-
-/* ---- Break: LCR bit 6 held BRK_HOLD_CH character times, then off. A real
- * UART gives one 0x00 with BI for the whole break.
- *   polled  every character read as it arrives: one 0x00 with BI, no OE.
- *   late    nothing read until BRK_SETTLE after the break, then one LSR
- *           read: DR, BI, no OE, RBR 0x00. A second character shows as OE.
- * A host adapter reports a break only after about 15 character times. */
-
-#define BRK_HOLD_CH 40
-#define BRK_SETTLE  (3UL * TICKS_100MS)
-
-static int break_one(unsigned char mcr, int bi, unsigned char lcr, int late)
-{
-    unsigned long ch = frame_ticks(bi, lcr), hold = BRK_HOLD_CH * ch, settle = 20 * ch + BRK_SETTLE, t;
-    unsigned char l, l2 = 0, d = 0, c, got[3], gl[3];
-    int n = 0, i, ok, off = 0;
-    char fn[8], buf[40];
-
-    if (hold < TICKS_100MS)
-        hold = TICKS_100MS;
-    cur_bi = bi;
-    cur_lcr = lcr;
-    uart_init(mcr);
-    fmt_name(fn, lcr);
-    if (!wait_idle())
-        return 0;
-    t_sleep(4 * ch);
-    drain_rx();
-    (void) inp(port + REG_LSR);
-
-    outp(port + REG_LCR, (unsigned char) (lcr | 0x40));
-    if (late) {
-        t_sleep(hold);
-        outp(port + REG_LCR, lcr);
-        t_sleep(settle);
-        l = (unsigned char) inp(port + REG_LSR);
-        if (l & LSR_DR)
-            d = (unsigned char) inp(port + REG_DATA);
-        l2 = (unsigned char) inp(port + REG_LSR);
-        ok = (l & (LSR_DR | LSR_OE | LSR_BI)) == (LSR_DR | LSR_BI) && d == 0x00 && !(l2 & LSR_DR);
-        if (!ok)
-            note("brk %lu %s late: LSR %02X RBR %02X, then LSR %02X (want 11+ 00, no DR)",
-                 baud_tab[bi], fn, l, d, l2);
-    } else {
-        t_start();
-        for (;;) {
-            t = t_now();
-            if (!off && t >= hold) {
-                outp(port + REG_LCR, lcr);
-                off = 1;
-                t_start();
-                continue;
-            }
-            if (off && t >= settle)
-                break;
-            l = (unsigned char) inp(port + REG_LSR);
-            if (l & LSR_DR) {
-                c = (unsigned char) inp(port + REG_DATA);
-                if (n < 3) {
-                    got[n] = c;
-                    gl[n] = l;
-                }
-                n++;
-            }
-        }
-        ok = n == 1 && got[0] == 0x00 && (gl[0] & (LSR_OE | LSR_BI)) == LSR_BI;
-        if (!ok) {
-            buf[0] = 0;
-            for (i = 0; i < n && i < 3; i++)
-                sprintf(buf + strlen(buf), " %02X/%02X", got[i], gl[i]);
-            note("brk %lu %s polled: %d chars%s (want 1: 00/BI)", baud_tab[bi], fn, n, buf);
-        }
-    }
-    drain_rx();
-    return ok;
-}
-
-static int break_test(unsigned char mcr, int late)
-{
-    int ok = break_one(mcr, top_bi(), 0x03, late);
-    if (!break_one(mcr, BI_2400, 0x1A, late))
-        ok = 0;
-    cur_bi = top_bi();
-    cur_lcr = 0x03;
-    uart_init(mcr);
-    return ok;
-}
-
-/* -------------------------------------------------------------- panels */
-
-#define RUN_CHK(p, i, expr) do { key_poll(); if (stop_req) break; set_chk(p, i, ST_RUN); set_chk(p, i, (expr) ? ST_PASS : ST_FAIL); } while (0)
-
-static int scratch_test(void)
-{
-    static const unsigned char pat[4] = { 0x55, 0xAA, 0x00, 0xFF };
-    int i, ok = 1;
-    for (i = 0; i < 4; i++) {
-        outp(port + REG_SCR, pat[i]);
-        if ((unsigned char) inp(port + REG_SCR) != pat[i])
-            ok = 0;
-    }
-    return ok;
-}
-
-/* THRE and TEMT both drop when THR is written, then return once the byte
- * shifts out. */
-static int thre_test(unsigned char mcr)
-{
-    unsigned char l;
-    int ok = 0;
-
-    uart_init(mcr);
-    t_start();
-    while ((inp(port + REG_LSR) & (LSR_THRE | LSR_TEMT)) != (LSR_THRE | LSR_TEMT) && t_now() < TMO_TICKS)
-        ;
-    outp(port + REG_DATA, 0x3C);
-    l = (unsigned char) inp(port + REG_LSR);
-    if (!(l & LSR_TEMT)) {
-        t_start();
-        while ((inp(port + REG_LSR) & (LSR_THRE | LSR_TEMT)) != (LSR_THRE | LSR_TEMT) && t_now() < TMO_TICKS)
-            ;
-        ok = (inp(port + REG_LSR) & (LSR_THRE | LSR_TEMT)) == (LSR_THRE | LSR_TEMT);
-    }
-    t_sleep(TICKS_10MS);
-    drain_rx();
-    return ok;
-}
-
-/* LSR & mask == want within TMO_TICKS. */
-static int wait_lsr(unsigned char mask, unsigned char want)
-{
-    t_start();
-    while ((inp(port + REG_LSR) & mask) != want && t_now() < TMO_TICKS)
-        ;
-    return (inp(port + REG_LSR) & mask) == want;
-}
-
-/* FCR bit 0 switches FIFO mode and clears both FIFOs.
- * A: FIFO off to on with a byte in THR. B: on to off with bytes queued.
- *    THRE and TEMT must settle.
- * C: a received byte waiting. The switch clears it so DR reads 0. */
-static int fcrsw_test(unsigned char mcr)
-{
-    const unsigned char idle = LSR_THRE | LSR_TEMT;
-    unsigned char l;
-    int ok = 1, i, m;
-
-    uart_init(mcr);
-    (void) wait_lsr(idle, idle);
-    outp(port + REG_DATA, 0x3C);
-    outp(port + REG_FCR, 0x01);
-    if (!wait_lsr(idle, idle)) {
-        note("fcrsw off->on, byte in THR: THRE/TEMT stuck, LSR %02X", inp(port + REG_LSR));
-        ok = 0;
-    }
-    t_sleep(TICKS_100MS);
-    drain_rx();
-
-    uart_init(mcr);
-    (void) wait_lsr(idle, idle);
-    outp(port + REG_FCR, 0x07);
-    for (i = 0; i < 4; i++)
-        outp(port + REG_DATA, (unsigned char) (0xA0 + i));
-    outp(port + REG_FCR, 0x00);
-    if (!wait_lsr(idle, idle)) {
-        note("fcrsw on->off, bytes queued: THRE/TEMT stuck, LSR %02X", inp(port + REG_LSR));
-        ok = 0;
-    }
-    t_sleep(TICKS_100MS);
-    drain_rx();
-
-    for (m = 0; m < 2; m++) {
-        uart_init(mcr);
-        (void) wait_lsr(idle, idle);
-        if (m)
-            outp(port + REG_FCR, 0x07);
-        outp(port + REG_DATA, 0x5A);
-        if (!wait_lsr(LSR_DR, LSR_DR)) {
-            note("fcrsw %s: no DR before the switch", m ? "on->off" : "off->on");
-            ok = 0;
-            continue;
-        }
-        outp(port + REG_FCR, m ? 0x00 : 0x01);
-        l = (unsigned char) inp(port + REG_LSR);
-        if (l & (LSR_DR | 0x80)) {
-            note("fcrsw %s, byte waiting: LSR %02X after the switch (want DR and bit 7 clear)",
-                 m ? "on->off" : "off->on", l);
-            ok = 0;
-        }
-        t_sleep(TICKS_100MS);
-        drain_rx();
-    }
-
-    outp(port + REG_FCR, 0x00);
-    return ok;
-}
-
-/* ---- WD76C30 UART type switch, Amstrad MegaPC. Index at LPT base + 3,
- * data at LPT base + 7. Register 5 bit 0 is 1 for 16550 and 0 for 16450.
- * Change it read-modify-write and keep the index clock bits. */
-static void wd_set(unsigned char r5)
-{
-    outp(wd_lpt + 3, (wd_sel & 0xF8) | 0x05);
-    outp(wd_lpt + 7, r5);
-}
-
-static void wd_restore(void)
-{
-    wd_set(wd_r5);
-    outp(wd_lpt + 3, wd_sel);
-}
-
-/* Only on a UART that reads as 16450 with an LPT1. Setting register 5
- * bit 0 must give the UART a FIFO, IIR 7:6 = C0. FCR=00 before switching
- * back. */
-static void detect_typesw(void)
-{
-    unsigned int lpt = *(unsigned int far *) MK_FP(0x0040, 0x0008);
-    unsigned char iir;
-
-    wd_lpt = 0;
-    if (has_fifo || !has_scr || !lpt)
-        return;
-    wd_sel = (unsigned char) inp(lpt + 3);
-    outp(lpt + 3, (wd_sel & 0xF8) | 0x05);
-    if ((unsigned char) inp(lpt + 3) != ((wd_sel & 0xF8) | 0x05)) {
-        outp(lpt + 3, wd_sel);
-        return;
-    }
-    wd_r5 = (unsigned char) inp(lpt + 7);
-    wd_lpt = lpt;
-    wd_set((unsigned char) (wd_r5 | 0x01));
-    outp(port + REG_FCR, 0x07);
-    iir = (unsigned char) (inp(port + REG_IIR) & 0xC0);
-    outp(port + REG_FCR, 0x00);
-    wd_restore();
-    if (iir != 0xC0)
-        wd_lpt = 0;
-}
-
-/* NSEND bytes back to back, none read until the last lands, then how many
- * RBR or the RX FIFO holds, the last one read, and OE. Same polling rule as
- * overrun_test. */
-#define TYPESW_N 4
-
-static void typesw_buf(int *held, int *oe, unsigned char *last)
-{
-    unsigned long ch = frame_ticks(cur_bi, cur_lcr);
-    unsigned char l;
-    int i;
-
-    *held = *oe = 0;
-    *last = 0;
-    if (!wait_idle())
-        return;
-    (void) inp(port + REG_LSR);
-    for (i = 0; i < TYPESW_N; i++) {
-        if (i && !wait_thre())
-            return;
-        outp(port + REG_DATA, (unsigned char) (0x41 + i));
-    }
-    t_sleep(20 * ch + TICKS_100MS / 2);
-    l = (unsigned char) inp(port + REG_LSR);
-    while ((l & LSR_DR) && *held < 64) {
-        if (l & LSR_OE)
-            *oe = 1;
-        *last = (unsigned char) inp(port + REG_DATA);
-        (*held)++;
-        l = (unsigned char) inp(port + REG_LSR);
-    }
-    if (l & LSR_OE)
-        *oe = 1;
-}
-
-/* One phase: fifo=1 wants IIR C0, 4 held, no OE. fifo=0 wants IIR 00,
- * 1 held, the last byte sent, and OE. */
-static int typesw_one(const char *what, int fifo)
-{
-    unsigned char iir = (unsigned char) (inp(port + REG_IIR) & 0xC0), last;
-    int held, oe, ok;
-
-    typesw_buf(&held, &oe, &last);
-    ok = fifo ? (iir == 0xC0 && held == TYPESW_N && !oe)
-              : (iir == 0x00 && held == 1 && oe && last == 0x40 + TYPESW_N);
-    if (!ok)
-        note("typesw %s: IIR %02X held %d OE %d RBR %02X (want %s)", what, iir, held, oe, last,
-             fifo ? "C0 4 0 44" : "00 1 1 44");
-    return ok;
-}
-
-static int typesw_test(unsigned char mcr)
-{
-    int ok = 1;
-
-    cur_bi = top_bi();
-    cur_lcr = 0x03;
-    uart_init(mcr);
-    wd_set((unsigned char) (wd_r5 | 0x01));
-    outp(port + REG_FCR, 0x07);
-    ok &= typesw_one("16550 FIFO on", 1);
-    wd_set((unsigned char) (wd_r5 & ~0x01));
-    ok &= typesw_one("->16450", 0);
-    outp(port + REG_FCR, 0x00);
-    ok &= typesw_one("16450 FCR=00", 0);
-    wd_restore();
-    uart_init(mcr);
-    drain_rx();
-    return ok;
-}
-
-/* Delta bits: raise every line together and OR in each delta seen, since
- * MSR reads clear them. DCTS DDSR DDCD must be seen, TERI not, and a re-read
- * must find them cleared. Then drop the RI driver alone and TERI must set.
- * INT drives RTS DTR OUT1 OUT2, EXT drives RTS and DTR. */
-static int delta_test(int p)
-{
-    unsigned char base = p ? 0x00 : MCR_LOOP;
-    unsigned char up = p ? (MCR_RTS | MCR_DTR) : (MCR_RTS | MCR_DTR | MCR_OUT1 | MCR_OUT2);
-    unsigned char ri_drv = p ? MCR_DTR : MCR_OUT1;
-    unsigned char lines = MSR_CTS | MSR_DSR | MSR_DCD;
-    const unsigned char deltas = MSR_DCTS | MSR_DDSR | MSR_DDCD;
-    unsigned char m, seen = 0;
-    unsigned long t;
-    int ri = !(p && no_ri), ok;
-
-    if (ri)
-        lines |= MSR_RI;
-    uart_init(base);
-    t_start();
-    if (!wait_msr(lines, 0, &t)) {
-        note("delta: lines never all dropped");
-        return 0;
-    }
-    t_sleep(TICKS_10MS);
-    (void) inp(port + REG_MSR);
-    outp(port + REG_MCR, base | up);
-    t_start();
-    do {
-        m = (unsigned char) inp(port + REG_MSR);
-        seen |= m & 0x0F;
-    } while ((m & lines) != lines && t_now() < TMO_TICKS);
-    t_sleep(TICKS_1MS);
-    seen |= (unsigned char) (inp(port + REG_MSR) & 0x0F);
-    m = (unsigned char) inp(port + REG_MSR);
-    ok = (seen & deltas) == deltas && !(seen & MSR_TERI) && !(m & 0x0F);
-    if (!ok)
-        note("delta rise: deltas %02X, then %02X (want %02X, then 00)", seen, m & 0x0F, deltas);
-    if (ri) {
-        seen = 0;
-        outp(port + REG_MCR, base | (up & ~ri_drv));
-        t_start();
-        do {
-            m = (unsigned char) inp(port + REG_MSR);
-            seen |= m & 0x0F;
-        } while ((m & MSR_RI) && t_now() < TMO_TICKS);
-        t_sleep(TICKS_1MS);
-        seen |= (unsigned char) (inp(port + REG_MSR) & 0x0F);
-        if (!(seen & MSR_TERI)) {
-            ok = 0;
-            note("delta: RI fell, deltas %02X (no TERI 04)", seen);
-        }
-    }
-    outp(port + REG_MCR, base);
-    return ok;
-}
-
-/* ---- Interrupts: hook the vector, unmask the PIC line, enable one source
- * in IER, provoke it and check the ISR saw IIR report it. mcr must include
- * OUT2, which gates the IRQ line.
- *   RX       IER 1: one byte, IIR 4, the ISR reads A5
- *   THRE     IER 2: THR empty, IIR 2
- *   LSR      IER 4: overrun of three bytes, IIR 6, LSR OE
- *   MSR      IER 8: RTS toggled, DCTS, IIR 0
- *   TMO      IER 1, FIFO trigger 4: one byte below the trigger, IIR C after
- *            the timeout, the ISR reads A5, 16550A only */
-
-enum { IRQ_RX, IRQ_THRE, IRQ_LSR, IRQ_MSR, IRQ_TMO };
-
-static int irq_check(unsigned char mcr, int kind)
-{
-    static const unsigned char ier[5]  = { 0x01, 0x02, 0x04, 0x08, 0x01 };
-    static const unsigned char want[5] = { 0x04, 0x02, 0x06, 0x00, 0x0C };
-    static const char *what[5] = { "RX data", "THR empty", "line status", "modem status", "FIFO timeout" };
-    unsigned char vec = (unsigned char) (irq + 8), bit = (unsigned char) (1 << irq), mask;
-    int ok;
-
-    cur_bi = top_bi();
-    cur_lcr = 0x03;
-    uart_init(mcr);
-    t_sleep(TICKS_10MS);
-    drain_rx();
-    if (kind == IRQ_TMO)
-        outp(port + REG_FCR, 0x47);     /* FIFOs on and cleared, RX trigger 4 */
-    (void) inp(port + REG_LSR);
-    (void) inp(port + REG_MSR);
-    (void) inp(port + REG_IIR);
-    isr_hits = 0;
-    isr_data = -1;
-    isr_iir = 0xFF;
-    isr_lsr = 0;
-
-    old_isr = _dos_getvect(vec);
-    _dos_setvect(vec, com_isr);
-    mask = (unsigned char) inp(PIC1_DATA);
-    outp(PIC1_DATA, mask & ~bit);
-    outp(port + REG_IER, ier[kind]);
-
-    switch (kind) {
-    case IRQ_LSR:
-        if (wait_thre()) {
-            outp(port + REG_DATA, 0x11);
-            if (wait_thre()) {
-                outp(port + REG_DATA, 0x22);
-                if (wait_thre())
-                    outp(port + REG_DATA, 0x33);
-            }
-        }
-        break;
-    case IRQ_MSR:
-        outp(port + REG_MCR, mcr ^ MCR_RTS);
-        break;
-    default:
-        if (wait_thre())
-            outp(port + REG_DATA, 0xA5);
-        break;
-    }
-    t_start();
-    while (isr_hits == 0 && t_now() < TMO_TICKS)
-        ;
-
-    outp(port + REG_IER, 0x00);
-    outp(PIC1_DATA, (inp(PIC1_DATA) & ~bit) | (mask & bit));
-    _dos_setvect(vec, old_isr);
-    outp(port + REG_FCR, 0x00);
-    outp(port + REG_MCR, mcr);
-
-    ok = isr_hits > 0 && (isr_iir & 0x0F) == want[kind];
-    if (kind == IRQ_RX || kind == IRQ_TMO)
-        ok = ok && isr_data == 0xA5;
-    if (kind == IRQ_LSR)
-        ok = ok && (isr_lsr & LSR_OE);
-    if (!ok)
-        note("irq %s: %u hit(s), IIR %02X (want %X), data %d, LSR %02X",
-             what[kind], isr_hits, isr_iir, want[kind], isr_data, isr_lsr);
-    t_sleep(TICKS_10MS);
-    drain_rx();
-    return ok;
-}
-
-/* Every page 1 check on one panel, 0 INT or 1 EXT. */
-static void run_panel(int p)
-{
-    unsigned char base = p ? 0x00 : MCR_LOOP;
-    unsigned char irqm = p ? (MCR_OUT2 | MCR_RTS | MCR_DTR) : (MCR_LOOP | MCR_OUT2);
-    int i;
-
-    note_panel = p ? "EXT" : "INT";
-    cur_bi = top_bi();
-    cur_lcr = 0x03;
-    uart_init(base);
-
-    if (p) {
-        t_sleep(TICKS_100MS);           /* let a plug see the lines drop */
-        key_poll();
-        if (stop_req) {
-            uart_init(0x00);
-            return;
-        }
-        ext_noplug = 0;
-        set_chk(1, C_PLUG, ST_RUN);
-        if (!line_test(0x00, MCR_RTS, MSR_CTS, 2, NULL)) {
-            ext_noplug = 1;
-            note("no plug: RTS never came back on CTS");
-            set_chk(1, C_PLUG, ST_FAIL);
-            for (i = 0; i < NCHK; i++)
-                if (chk_st[1][i] == ST_PEND)
-                    set_chk(1, i, ST_SKIP);
-            return;
-        }
-        set_chk(1, C_PLUG, ST_PASS);
-    } else if (has_scr)
-        RUN_CHK(0, C_SCRATCH, scratch_test());
-    else
-        set_chk(0, C_SCRATCH, ST_NA);       /* 8250: no scratch register */
-
-    RUN_CHK(p, C_DATA, data_test(base));
-    RUN_CHK(p, C_FMT, format_test(base, top_bi()));
-    if (top_bi() == BI_2400)
-        set_chk(p, C_FMT2400, ST_NA);   /* the row above already ran at 2400 */
-    else
-        RUN_CHK(p, C_FMT2400, format_test(base, BI_2400));
-    if (has_fifo && burst_bi() >= 0)
-        RUN_CHK(p, C_BURST, burst_test(base, p ? 0x5A5A : 0x1234));
-    else
-        set_chk(p, C_BURST, ST_NA);
-    RUN_CHK(p, C_OVERRUN, overrun_test(base));
-    if (p && no_brk) {
-        set_chk(p, C_BRKPOLL, ST_NC);
-        set_chk(p, C_BRKLATE, ST_NC);
-    } else {
-        RUN_CHK(p, C_BRKPOLL, break_test(base, 0));
-        RUN_CHK(p, C_BRKLATE, break_test(base, 1));
-    }
-    RUN_CHK(p, C_THRE, thre_test(base));
-    if (has_fifo)
-        RUN_CHK(p, C_FCRSW, fcrsw_test(base));
-    else
-        set_chk(p, C_FCRSW, ST_NA);
-    if (!p) {
-        if (wd_lpt)
-            RUN_CHK(0, C_TYPESW, typesw_test(base));
-        else
-            set_chk(0, C_TYPESW, ST_NA);
-    }
-
-    RUN_CHK(p, C_RTS, line_test(base, MCR_RTS, MSR_CTS, 8, NULL));
-    RUN_CHK(p, C_DTR, line_test(base, MCR_DTR, MSR_DSR, 8, NULL));
-    RUN_CHK(p, C_DCD, line_test(base, p ? MCR_DTR : MCR_OUT2, MSR_DCD, 4, NULL));
-    if (p && no_ri)
-        set_chk(p, C_RI, ST_NC);
-    else
-        RUN_CHK(p, C_RI, line_test(base, p ? MCR_DTR : MCR_OUT1, MSR_RI, 4, NULL));
-    RUN_CHK(p, C_DELTA, delta_test(p));
-
-    RUN_CHK(p, C_IRQRX, irq_check(irqm, IRQ_RX));
-    RUN_CHK(p, C_IRQTHRE, irq_check(irqm, IRQ_THRE));
-    RUN_CHK(p, C_IRQLSR, irq_check(irqm, IRQ_LSR));
-    RUN_CHK(p, C_IRQMSR, irq_check(irqm, IRQ_MSR));
-    if (has_fifo)
-        RUN_CHK(p, C_IRQTMO, irq_check(irqm, IRQ_TMO));
-    else
-        set_chk(p, C_IRQTMO, ST_NA);
-
-    uart_init(0x00);
-}
+#include "sertest_core.c"
 
 /* ------------------------------------------------------- latency mode */
 
@@ -1818,12 +536,12 @@ static unsigned long lat_sample(struct lat_line *l)
     }
     rising = !l->edge;
     l->edge ^= 1;
-    outp(port + REG_MCR, rising ? lat_base : (lat_base | l->d->obit));
+    hw_out(port + REG_MCR, rising ? lat_base : (lat_base | l->d->obit));
     t_start();
     if (!wait_msr(l->d->ibit, rising ? 0 : l->d->ibit, &t))
         return LAT_TMO;
     t_start();
-    outp(port + REG_MCR, rising ? (lat_base | l->d->obit) : lat_base);
+    hw_out(port + REG_MCR, rising ? (lat_base | l->d->obit) : lat_base);
     return wait_msr(l->d->ibit, rising ? l->d->ibit : 0, &t) ? t : LAT_TMO;
 }
 
@@ -2137,7 +855,7 @@ static void run_latency(void)
                 if (k == 0)
                     (void) getch();          /* extended key: ignore */
                 else if (k == 27) {
-                    outp(port + REG_MCR, lat_base);
+                    hw_out(port + REG_MCR, lat_base);
                     log_hms(ts);
                     /* Marker the testlist polls b_drive.img for, upper-cased at run time. */
                     strcpy(names, "sertest lat done");
@@ -2187,7 +905,7 @@ static void run_latency(void)
                 lat_prompt(cycle);          /* at nlat: Enter is live */
             }
         }
-        outp(port + REG_MCR, lat_base);
+        hw_out(port + REG_MCR, lat_base);
         if (next == 2)
             cur = 0;
         else
@@ -2196,65 +914,7 @@ static void run_latency(void)
     }
 }
 
-/* ------------------------------------------------- page 2: baud cycle */
-
-#define P2_SAMP   8             /* idle-line BURST samples per rate */
-#define P2_SLACK  36            /* about 30 us of polling slack on every bound */
-#define P2_FRAME  10            /* bits per 8N1 character */
-#define P2_HDR    2             /* column header row */
-#define P2_FIRST  3             /* first rate row */
-#define P2_ROWS   15            /* frame content rows: header, 12 rates, 2 summary */
-#define P2_GRAPH  17            /* graph offset inside the panel; 20 cells */
-#define P2_SLOW_LINE (2 * TICKS_1MS)
-struct p2_res {
-    unsigned long bmin, bmax;           /* BURST, PIT ticks */
-    unsigned long first, run, span, gmin, gmax;   /* long run timings */
-    unsigned long line;                 /* worst RTS->CTS / DTR->DSR edge */
-    int n;                              /* run length */
-    unsigned char st;                   /* ST_PEND / ST_PASS / ST_FAIL */
-    unsigned char slow;
-    unsigned char cpu;                  /* RUN not run, CPU too slow */
-};
-static struct p2_res p2[2][NBAUD];
-
-/* Bit period of rate i in 1/64 PIT ticks, 1.8432 MHz / 16 / divisor. */
-static unsigned long bit64(int i)
-{
-    return ((PIT_HZ * 64UL + 57600UL) / 115200UL) * div_tab[i];
-}
-
-/* PIT ticks to tenths of a bit period at rate i */
-static unsigned long bits10(unsigned long t, int i)
-{
-    return (t * 640UL + bit64(i) / 2) / bit64(i);
-}
-
-static void fmt_bits(char *buf, unsigned long t, int i)
-{
-    unsigned long b = bits10(t, i);
-    if (b > 999)
-        strcpy(buf, ">99");
-    else
-        sprintf(buf, "%lu.%lu", b / 10, b % 10);
-}
-
-/* RUN in tenths of a bit from the whole first..last DR span. Truncating
- * per byte ticks read 9.9 for 10.0. */
-static unsigned long run10(const struct p2_res *q, int i)
-{
-    unsigned long m = (unsigned long) (q->n - 1);
-    return q->n > 1 ? (bits10(q->span, i) + m / 2) / m : 0;
-}
-
-static int wait_idle(void)
-{
-    t_start();
-    while ((inp(port + REG_LSR) & (LSR_THRE | LSR_TEMT)) != (LSR_THRE | LSR_TEMT))
-        if (t_now() >= TMO_TICKS)
-            return 0;
-    drain_rx();
-    return 1;
-}
+#include "sertest_core_p2.c"
 
 /* After a timeout or wrong byte, read and discard until the line is quiet
  * for 4 character times, 100 ms at least and 3 s at most. */
@@ -2268,8 +928,8 @@ static void resync(void)
     t_start();
     for (;;) {
         t = t_now();
-        if (inp(port + REG_LSR) & LSR_DR) {
-            (void) inp(port + REG_DATA);
+        if (hw_in(port + REG_LSR) & LSR_DR) {
+            (void) hw_in(port + REG_DATA);
             last = t;
             if (++n >= 64)
                 break;
@@ -2296,12 +956,12 @@ static int xfer_idle(unsigned char b, unsigned long pre, unsigned long *t)
     if (pre)
         t_sleep(pre);
     t_start();
-    outp(port + REG_DATA, b);
-    while (!((l = (unsigned char) inp(port + REG_LSR)) & LSR_DR))
+    hw_out(port + REG_DATA, b);
+    while (!((l = (unsigned char) hw_in(port + REG_LSR)) & LSR_DR))
         if (t_now() >= TMO_TICKS)
             return 0;
     *t = t_now();
-    c = (unsigned char) inp(port + REG_DATA);
+    c = (unsigned char) hw_in(port + REG_DATA);
     bad_want = b; bad_got = c; bad_lsr = l; bad_at = 0;
     return (c == b && !(l & 0x0E)) ? 1 : -1;
 }
@@ -2326,12 +986,12 @@ static int xfer_run(int n, struct p2_res *r)
     r->gmin = LAT_TMO;
     r->gmax = 0;
     t_start();
-    outp(port + REG_DATA, pat_tab[sent++ & 7]);
+    hw_out(port + REG_DATA, pat_tab[sent++ & 7]);
     for (;;) {
-        l = (unsigned char) inp(port + REG_LSR);
+        l = (unsigned char) hw_in(port + REG_LSR);
         t = t_now();
         if (l & LSR_DR) {
-            c = (unsigned char) inp(port + REG_DATA);
+            c = (unsigned char) hw_in(port + REG_DATA);
             if ((c != pat_tab[recv & 7] || (l & 0x0E)) && !bad) {
                 bad = 1;
                 bad_want = pat_tab[recv & 7]; bad_got = c; bad_lsr = l; bad_at = recv;
@@ -2348,7 +1008,7 @@ static int xfer_run(int n, struct p2_res *r)
                 break;
         }
         if ((l & LSR_THRE) && sent < n)
-            outp(port + REG_DATA, pat_tab[sent++ & 7]);
+            hw_out(port + REG_DATA, pat_tab[sent++ & 7]);
         if (t - (recv ? prev : 0) >= TMO_TICKS)
             return 0;
     }
@@ -3003,7 +1663,7 @@ static void p3_line(int p, int k)
         if (stop_req)
             break;
         rising = !(s & 1);
-        outp(port + REG_MCR, rising ? base : (base | ob));
+        hw_out(port + REG_MCR, rising ? base : (base | ob));
         t_start();
         if (!wait_msr(ib, rising ? 0 : ib, &t)) {
             q->seq[q->ns] = LAT_TMO;
@@ -3012,7 +1672,7 @@ static void p3_line(int p, int k)
             continue;
         }
         t_start();
-        outp(port + REG_MCR, rising ? (base | ob) : base);
+        hw_out(port + REG_MCR, rising ? (base | ob) : base);
         if (!wait_msr(ib, rising ? ib : 0, &t))
             t = LAT_TMO;
         q->seq[q->ns] = t;
@@ -3020,7 +1680,7 @@ static void p3_line(int p, int k)
         q->sent[q->ns++] = (unsigned char) rising;
         p3_add(q, t);
     }
-    outp(port + REG_MCR, base);
+    hw_out(port + REG_MCR, base);
     q->st = (unsigned char) ((q->tmo || !q->n) ? ST_FAIL : ST_PASS);
     q->slow = (unsigned char) (q->n && q->max > P2_SLOW_LINE);
     if (q->tmo)
@@ -3774,7 +2434,7 @@ static void lane_step(struct lane *l, unsigned long now)
     unsigned char msr, lsr, d, dl, chg, want;
     unsigned long t;
 
-    msr = (unsigned char) inp(l->base + REG_MSR);
+    msr = (unsigned char) hw_in(l->base + REG_MSR);
     dl = (unsigned char) (msr & 0x0F);
     if (l->dexp_t && now >= l->dexp_t) {
         l->dexp = 0;
@@ -3813,26 +2473,26 @@ static void lane_step(struct lane *l, unsigned long now)
     case LN_SEND:
         if (l->ending)
             break;
-        lsr = (unsigned char) inp(l->base + REG_LSR);
+        lsr = (unsigned char) hw_in(l->base + REG_LSR);
         if (!(lsr & LSR_THRE))
             break;
         if (lsr & LSR_DR) {
-            d = (unsigned char) inp(l->base + REG_DATA);
+            d = (unsigned char) hw_in(l->base + REG_DATA);
             if (l->bad++ < 2)
                 lane_note(l, "stray byte (got,LSR)", d, lsr);
             break;
         }
         l->sent = (unsigned char) (dpat[l->k][l->pos] & l->mask);
         l->t0 = t_now();                /* the clock right at the write */
-        outp(l->base + REG_DATA, l->sent);
+        hw_out(l->base + REG_DATA, l->sent);
         l->st = LN_WAIT;
         break;
 
     case LN_WAIT:
-        lsr = (unsigned char) inp(l->base + REG_LSR);
+        lsr = (unsigned char) hw_in(l->base + REG_LSR);
         if (lsr & LSR_DR) {
             t = t_now() - l->t0;        /* right at DR */
-            d = (unsigned char) inp(l->base + REG_DATA);
+            d = (unsigned char) hw_in(l->base + REG_DATA);
             if (lsr & (LSR_OE | 0x04 | 0x08 | LSR_BI)) {
                 if (l->lsrerr++ < 2)
                     lane_note(l, "LSR error (LSR,got)", lsr, d);
@@ -3858,14 +2518,14 @@ static void lane_step(struct lane *l, unsigned long now)
                 l->dexp |= (unsigned char) (l->togdtr ? (MSR_DDSR | MSR_DDCD | MSR_TERI) : MSR_DCTS);
                 l->dexp_t = 0;
                 l->lt0 = now;
-                outp(l->base + REG_MCR, l->mcr);
+                hw_out(l->base + REG_MCR, l->mcr);
                 l->nexttog = l->nbytes + (l->k ? 7 : 5);
                 l->togdtr = !l->togdtr;
             }
             if (l->brk_on && !l->ending && l->nbytes % DUAL_BRK_EV == (l->k ? DUAL_BRK_EV / 2 : 0)) {
                 l->brk_n++;
                 l->t0 = now;
-                outp(l->base + REG_LCR, l->lcr | 0x40);
+                hw_out(l->base + REG_LCR, l->lcr | 0x40);
                 l->st = LN_BRK;
             }
         } else if (now - l->t0 >= TMO_TICKS) {
@@ -3879,16 +2539,16 @@ static void lane_step(struct lane *l, unsigned long now)
 
     case LN_BRK:
         if (now - l->t0 >= DUAL_BRK_CH * l->frame) {
-            outp(l->base + REG_LCR, l->lcr);
+            hw_out(l->base + REG_LCR, l->lcr);
             l->t0 = now;
             l->st = LN_BRKWAIT;
         }
         break;
 
     case LN_BRKWAIT:
-        lsr = (unsigned char) inp(l->base + REG_LSR);
+        lsr = (unsigned char) hw_in(l->base + REG_LSR);
         if (lsr & LSR_DR) {
-            d = (unsigned char) inp(l->base + REG_DATA);
+            d = (unsigned char) hw_in(l->base + REG_DATA);
             if ((lsr & LSR_BI) && d == 0)
                 l->brk_ok++;
             else
@@ -3902,9 +2562,9 @@ static void lane_step(struct lane *l, unsigned long now)
         break;
 
     case LN_BRKQUIET:              /* a real UART gives ONE 0x00 for a break */
-        lsr = (unsigned char) inp(l->base + REG_LSR);
+        lsr = (unsigned char) hw_in(l->base + REG_LSR);
         if (lsr & LSR_DR) {
-            d = (unsigned char) inp(l->base + REG_DATA);
+            d = (unsigned char) hw_in(l->base + REG_DATA);
             if (l->brk_ok)
                 l->brk_ok--;
             lane_note(l, "2nd char on break (got,LSR)", d, lsr);
@@ -3940,25 +2600,25 @@ static void lane_init(struct lane *l, int p, int i)
     l->togdtr = k;
     l->st = -1;                 /* not started: shows RUN until the row ends */
     div = div_tab[l->bi];
-    outp(base + REG_IER, 0x00);
-    outp(base + REG_LCR, 0x80);
-    outp(base + REG_DLL, div & 0xFF);
-    outp(base + REG_DLH, div >> 8);
-    outp(base + REG_LCR, l->lcr);
-    outp(base + REG_FCR, 0x00);
-    outp(base + REG_MCR, l->mcr);
+    hw_out(base + REG_IER, 0x00);
+    hw_out(base + REG_LCR, 0x80);
+    hw_out(base + REG_DLL, div & 0xFF);
+    hw_out(base + REG_DLH, div >> 8);
+    hw_out(base + REG_LCR, l->lcr);
+    hw_out(base + REG_FCR, 0x00);
+    hw_out(base + REG_MCR, l->mcr);
 }
 
 static void lane_settle(struct lane *l)
 {
     int n = 0;
     t_start();
-    while ((inp(l->base + REG_MSR) & (MSR_CTS | MSR_DSR)) && t_now() < TICKS_100MS)
+    while ((hw_in(l->base + REG_MSR) & (MSR_CTS | MSR_DSR)) && t_now() < TICKS_100MS)
         ;
-    while ((inp(l->base + REG_LSR) & LSR_DR) && n++ < 64)
-        (void) inp(l->base + REG_DATA);
-    (void) inp(l->base + REG_LSR);
-    l->last_msr = (unsigned char) inp(l->base + REG_MSR);    /* clears the deltas */
+    while ((hw_in(l->base + REG_LSR) & LSR_DR) && n++ < 64)
+        (void) hw_in(l->base + REG_DATA);
+    (void) hw_in(l->base + REG_LSR);
+    l->last_msr = (unsigned char) hw_in(l->base + REG_MSR);    /* clears the deltas */
 }
 
 static void dual_one(int p, int i)
@@ -4010,8 +2670,8 @@ static void dual_one(int p, int i)
         if (l->n == 0)
             lane_note(l, "no round trip", 0, 0);
         l->slow = (unsigned char) (l->n && (l->sum / l->n > l->bound || l->lmax > 2UL * TICKS_1MS));
-        outp(l->base + REG_LCR, l->lcr);
-        outp(l->base + REG_MCR, (unsigned char) (p ? 0 : MCR_LOOP));
+        hw_out(l->base + REG_LCR, l->lcr);
+        hw_out(l->base + REG_MCR, (unsigned char) (p ? 0 : MCR_LOOP));
     }
     stage(name, lane_ok(a) && lane_ok(b) ? "PASS" : "FAIL");
     if (cur_page == (p ? 1 : 2)) {
@@ -4178,7 +2838,7 @@ static int run_dual(void)
     static const char *what[3] = { "step 1 SINGLE (each port alone)", "step 2 EXT (both at once)",
                                    "step 3 INT (both at once)" };
     static const unsigned int defb[2] = { 0x3F8, 0x2F8 };
-    unsigned int far *bda = (unsigned int far *) MK_FP(0x0040, 0x0000);
+    hw_wptr bda = (hw_wptr) hw_bda(0x0000);
     int k, s;
 
     log_name = "DUALLOG.TXT";
@@ -4288,7 +2948,7 @@ static int parse_args(int argc, char **argv)
 int main(int argc, char **argv)
 {
     static const unsigned int defbase[4] = { 0x3F8, 0x2F8, 0x3E8, 0x2E8 };
-    unsigned int far *bda = (unsigned int far *) MK_FP(0x0040, 0x0000);
+    hw_wptr bda = (hw_wptr) hw_bda(0x0000);
     int pass, k;
 
     if (!parse_args(argc, argv)) {
@@ -4309,7 +2969,7 @@ int main(int argc, char **argv)
            ? (unsigned char far *) MK_FP(0xB000, 0)
            : (unsigned char far *) MK_FP(0xB800, 0);
     cursor(0);
-    pit_mode(0x34);
+    hw_timer_begin();
     clk_init();
     detect_cpu();
 
@@ -4367,7 +3027,7 @@ int main(int argc, char **argv)
             pass = 0;                   /* stopped before the verdict */
     }
 
-    pit_mode(0x36);
+    hw_timer_end();
     cur_bi = top_bi();
     cur_lcr = 0x03;
     uart_init(MCR_DTR | MCR_RTS);
